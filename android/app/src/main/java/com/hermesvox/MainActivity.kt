@@ -474,7 +474,8 @@ class MainActivity : AppCompatActivity() {
             wireSoul(it)
         }
         c.attachListeners(listener)
-        if (!ModelCatalog.isInstalled(this, ModelCatalog.DEFAULT_STT_MODEL)) {
+        if (!ModelCatalog.isInstalled(this, ModelCatalog.DEFAULT_STT_MODEL) &&
+            prefs.getString(ModelCatalog.KEY_STT_BACKEND, "") != ElevenLabsSettings.BACKEND) {
             // #12: this used to be a dead label ("...Settings > Voice models").
             // It is now a tappable warning pill that opens the Voice-models
             // download screen (ModelsActivity) — the actual fix, not a name.
@@ -640,6 +641,15 @@ class MainActivity : AppCompatActivity() {
         // must never be covered by the gate.
         if (callLive || !endpointSet() || GatewayKey.isMissing(storedKey())) {
             modelsGate?.visibility = android.view.View.GONE
+            return
+        }
+        // Explicit all-cloud speech in ordinary Realtime does not require offline
+        // Whisper/Supertonic downloads. Other modes retain the existing model gate.
+        if (!modeIsEnhanced() &&
+            prefs.getString(ModelCatalog.KEY_STT_BACKEND, "") == ElevenLabsSettings.BACKEND &&
+            prefs.getString("tts", "") == ElevenLabsSettings.BACKEND) {
+            modelsGate?.visibility = android.view.View.GONE
+            modelsWarnReset()
             return
         }
         val missing = ModelCatalog.missingRequired(this)

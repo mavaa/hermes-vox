@@ -368,6 +368,7 @@ class VoiceController(private val context: Context, private val session: HermesS
     private fun buildStt(): VoxStt? {
         val backend = prefString(ModelCatalog.KEY_STT_BACKEND, ModelCatalog.BACKEND_ONDEVICE)
         val model = prefString(ModelCatalog.KEY_STT_MODEL, ModelCatalog.DEFAULT_STT_MODEL)
+        if (backend == ElevenLabsSettings.BACKEND) return ElevenLabsStt(context)
         return when (resolveSttLeg(backend, prefString(KEY_STT_REMOTE_URL, ""),
             ModelCatalog.isInstalled(context, model))) {
             ModelCatalog.BACKEND_REMOTE -> RemoteStt(context).also { remoteLeg = it }
@@ -526,7 +527,8 @@ class VoiceController(private val context: Context, private val session: HermesS
                     val segStart = android.os.SystemClock.uptimeMillis() - seg.size * 1000L / sr
                     if (seeded != null) speechStartAt = segStart   // the carry opens in speech
                     // VAD-driven segmentation: gather one utterance; close it on a pause.
-                    val partialEnabled = micBool("partial_stt", true)
+                    // Batch cloud transcription is final-only: no speculative uploads or repeated billing.
+                    val partialEnabled = micBool("partial_stt", true) && stt !is ElevenLabsStt
                     var lastPartialMs = android.os.SystemClock.uptimeMillis()
                     while (listening && !commitRequested && !focusPause) {
                         val n = r.read(shortBuf, 0, shortBuf.size)
@@ -798,7 +800,8 @@ class VoiceController(private val context: Context, private val session: HermesS
                         val spk = speaking
                         if (spk) { if (!sawPlayback) { sawPlayback = true; playbackSince = readAt } }
                         else sawPlayback = false
-                        if (!bargeInEnabled) continue                          // drain-only (no buffer flood)
+                        // ElevenLabs playback (PCM or batch) has no calibrated playback reference yet.
+                        if (!bargeInEnabled || ((spk || glueSpeaking) && tts is ElevenLabsTts)) continue // drain-only
                         val frames = FloatArray(n)
                         for (i in 0 until n) frames[i] = shortBuf[i] / 32768f
                         if (bargeAudio.fired) {
