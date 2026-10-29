@@ -108,6 +108,7 @@ class WarmTts(private val context: Context) : VoxTts {
 fun buildTts(context: Context, prefer: String): VoxTts {
     return try {
         when (prefer) {
+            "elevenlabs" -> ElevenLabsTts(context)
             "piper" -> if (ModelCatalog.isInstalled(context, "piper-lessac")) SherpaTts(context, SherpaVoice.PIPER)
                 else { VoxLog.d("tts: piper requested but model not installed -> system fallback"); SystemTts(context) }
             "supertonic" -> if (ModelCatalog.isInstalled(context, "supertonic")) SherpaTts(context, SherpaVoice.SUPERTONIC)

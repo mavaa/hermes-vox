@@ -158,6 +158,19 @@
         android:visibility="gone"
         android:text="00:00" />
 
+    <!-- Independent capture control stays reachable during listening/thinking/playback. -->
+    <Button
+        android:id="@+id/mic_mute"
+        style="@style/HvGhostButton"
+        android:layout_width="wrap_content"
+        android:layout_height="48dp"
+        android:minWidth="120dp"
+        android:layout_gravity="center_horizontal"
+        android:background="@drawable/bg_button_ghost"
+        android:text="@string/mic_mute"
+        android:contentDescription="@string/mic_live_action"
+        android:visibility="gone" />
+
     <!-- Secondary actions: gear (left) · call/hang-up (center) · commands (right) -->
     <LinearLayout
         android:layout_width="match_parent"

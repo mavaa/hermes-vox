@@ -419,9 +419,12 @@ class SettingsActivity : AppCompatActivity() {
     private fun bindFlows() {
         findViewById<LinearLayout>(R.id.row_stt).setOnClickListener {
             pick("Speech-to-text (backend)",
-                arrayOf("On-device (offline)", "Platform (Google)", "Remote (server)"),
-                arrayOf(ModelCatalog.BACKEND_ONDEVICE, ModelCatalog.BACKEND_PLATFORM, ModelCatalog.BACKEND_REMOTE),
-                ModelCatalog.KEY_STT_BACKEND, R.id.set_stt_val) { refreshSttRemotePanel() }
+                arrayOf("On-device (offline)", "Platform (Google)", "Remote (server)", "ElevenLabs (cloud, experimental batch)"),
+                arrayOf(ModelCatalog.BACKEND_ONDEVICE, ModelCatalog.BACKEND_PLATFORM, ModelCatalog.BACKEND_REMOTE, ElevenLabsSettings.BACKEND),
+                ModelCatalog.KEY_STT_BACKEND, R.id.set_stt_val) {
+                    refreshSttRemotePanel()
+                    if (prefs.getString(ModelCatalog.KEY_STT_BACKEND, "") == ElevenLabsSettings.BACKEND) configureElevenLabs()
+                }
         }
         findViewById<LinearLayout>(R.id.row_stt_model).setOnClickListener {
             val labels = ModelCatalog.sttModels.map { it.second }.toTypedArray()
@@ -447,8 +450,11 @@ class SettingsActivity : AppCompatActivity() {
         }
         findViewById<LinearLayout>(R.id.row_tts).setOnClickListener {
             pick("Text-to-speech",
-                arrayOf("Supertonic (on-device, recommended)", "Piper (on-device, lighter)", "System (fallback)"),
-                arrayOf("supertonic", "piper", "system"), "tts", R.id.set_tts_val) { syncSpeakerRow(); previewVoice() }
+                arrayOf("Supertonic (on-device, recommended)", "Piper (on-device, lighter)", "System (fallback)", "ElevenLabs (cloud, experimental)"),
+                arrayOf("supertonic", "piper", "system", ElevenLabsSettings.BACKEND), "tts", R.id.set_tts_val) {
+                    syncSpeakerRow()
+                    if (ttsEngine() == ElevenLabsSettings.BACKEND) configureElevenLabs() else previewVoice()
+                }
         }
         // Voice = the SYNTHESIS REGISTER (system/bright/deep). The old "warm"
         // option was removed — WarmTts is a no-op stub, so it never produced
@@ -702,7 +708,53 @@ class SettingsActivity : AppCompatActivity() {
         })
     }
 
+    /** Saving config never submits audio or starts a paid preview. Re-select either
+     * ElevenLabs picker item to reopen. Blank key preserves; explicit forget removes. */
+    private fun configureElevenLabs() {
+        val panel = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(32, 16, 32, 16) }
+        panel.addView(TextView(this).apply {
+            text = "Experimental cloud speech. STT uploads microphone audio; TTS uploads completed reply text (charges/retention may apply). v4/v4_turbo stream audio with lossless chunks up to 2000 characters; other models use batch audio. No speech barge-in during playback; use Stop. Hermes still owns the agent/session. Applies on next pipeline load."
+        })
+        fun field(hintText: String, value: String, secret: Boolean = false): EditText = EditText(this).apply {
+            hint = hintText
+            inputType = if (secret) android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
+                else android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            if (android.os.Build.VERSION.SDK_INT >= 26) importantForAutofill = android.view.View.IMPORTANT_FOR_AUTOFILL_NO
+            setText(value)
+            panel.addView(this)
+        }
+        val key = field("API key (blank keeps saved key)", "", true)
+        val sttModel = field("STT model ID", prefs.getString(ElevenLabsSettings.STT_MODEL, "scribe_v2").orEmpty())
+        val ttsModel = field("TTS model ID (required for speech; no fallback)", prefs.getString(ElevenLabsSettings.TTS_MODEL, "").orEmpty())
+        val voice = field("Voice ID (required for speech)", prefs.getString(ElevenLabsSettings.VOICE, "").orEmpty())
+        val scroll = android.widget.ScrollView(this).apply { addView(panel) }
+        val dialog = AlertDialog.Builder(this).setTitle("ElevenLabs speech only")
+            .setView(scroll).setPositiveButton("Save", null).setNegativeButton("Cancel", null)
+            .setNeutralButton("Forget key") { _, _ -> prefs.edit().remove(ElevenLabsSettings.KEY).apply() }
+            .create()
+        dialog.setOnShowListener {
+            dialog.window?.addFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE)
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val entered = key.text.toString()
+                if (entered.isNotEmpty()) {
+                    val saved = com.hermesvox.speech.ElevenLabsProtocol.storeKey(entered,
+                        { SecureStore.encrypt(it) }, { prefs.edit().putString(ElevenLabsSettings.KEY, it).apply() })
+                    if (!saved) {
+                        key.error = "Key not saved: invalid key or secure storage unavailable"
+                        return@setOnClickListener
+                    }
+                }
+                prefs.edit().putString(ElevenLabsSettings.STT_MODEL, sttModel.text.toString())
+                    .putString(ElevenLabsSettings.TTS_MODEL, ttsModel.text.toString())
+                    .putString(ElevenLabsSettings.VOICE, voice.text.toString()).apply()
+                dialog.dismiss()
+            }
+        }
+        dialog.show()
+    }
+
     private fun sttBackendLabel(tok: String): String = when (tok) {
+        ElevenLabsSettings.BACKEND -> "ElevenLabs (cloud batch)"
         ModelCatalog.BACKEND_PLATFORM -> "Platform (Google)"
         ModelCatalog.BACKEND_REMOTE -> "Remote (server)"
         else -> "On-device (offline)"
@@ -1121,6 +1173,8 @@ class SettingsActivity : AppCompatActivity() {
      *  loads for this line only and is released when it finishes (or the next preview starts). */
     private var preview: VoxTts? = null
     private fun previewVoice() {
+        // Cloud selection/configuration/delivery controls must not trigger paid previews.
+        if (ttsEngine() == ElevenLabsSettings.BACKEND) return
         preview?.let { try { it.stop(); it.shutdown() } catch (_: Throwable) {} }
         val t = buildTts(this, prefs.getString("tts", null) ?: ModelCatalog.defaultTts(this))
         preview = t
@@ -1284,6 +1338,7 @@ class SettingsActivity : AppCompatActivity() {
     private fun label(prefKey: String, default: String): String {
         val tok = prefs.getString(prefKey, default) ?: default
         return when (tok) {
+            ElevenLabsSettings.BACKEND -> "ElevenLabs (cloud batch)"
             "on-device" -> "On-device"
             "presence" -> "Being"; "conversation" -> "Transcript"
             "system" -> "System"; "kokoro" -> "System"; "piper" -> "Piper"; "supertonic" -> "Supertonic"

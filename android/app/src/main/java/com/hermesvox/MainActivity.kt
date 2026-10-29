@@ -462,6 +462,7 @@ class MainActivity : AppCompatActivity() {
             }
             return
         }
+        callMicMuted = false // A genuinely new call starts unmuted; rebuild/resume never reset it.
         openVoiceLine(s)
     }
 
@@ -474,7 +475,8 @@ class MainActivity : AppCompatActivity() {
             wireSoul(it)
         }
         c.attachListeners(listener)
-        if (!ModelCatalog.isInstalled(this, ModelCatalog.DEFAULT_STT_MODEL)) {
+        if (!ModelCatalog.isInstalled(this, ModelCatalog.DEFAULT_STT_MODEL) &&
+            prefs.getString(ModelCatalog.KEY_STT_BACKEND, "") != ElevenLabsSettings.BACKEND) {
             // #12: this used to be a dead label ("...Settings > Voice models").
             // It is now a tappable warning pill that opens the Voice-models
             // download screen (ModelsActivity) — the actual fix, not a name.
@@ -540,6 +542,7 @@ class MainActivity : AppCompatActivity() {
         callStartedAt = android.os.SystemClock.elapsedRealtime()
         callLive = true; callSeconds = 0
         c.setVoiceChannelOpen(true)   // the voice channel is open -> replies may speak
+        c.setMicrophoneMuted(callMicMuted)
         c.start(listener, prefs.getBoolean("duplex", true))
         enterCallUi()
         setStatus("On call", false)
@@ -587,6 +590,7 @@ class MainActivity : AppCompatActivity() {
         // turn). Re-arm it rather than only reflecting isListening(); c.start is
         // idempotent, so a loop that is still running is left untouched.
         c.setVoiceChannelOpen(true)
+        c.setMicrophoneMuted(callMicMuted)
         c.start(listener, prefs.getBoolean("duplex", true))
         callLive = true
         callSeconds = ((android.os.SystemClock.elapsedRealtime() - callStartedAt) / 1000L).toInt().coerceAtLeast(0)
@@ -609,10 +613,22 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updateCallButton() {
+        updateMicrophoneButton()
         val b = findViewById<Button>(R.id.call) ?: return
         if (callLive) { b.text = "\u2706"; b.setTextColor(0xFFFF5B5B.toInt()); b.contentDescription = "Hang up call" }
         else { b.text = "\u2706"; b.setTextColor(0xFF35D07F.toInt()); b.contentDescription = "Start call" }
     }
+    private fun updateMicrophoneButton() {
+        findViewById<Button>(R.id.mic_mute)?.apply {
+            visibility = if (callLive) android.view.View.VISIBLE else android.view.View.GONE
+            isEnabled = callLive
+            isSelected = callMicMuted
+            text = getString(if (callMicMuted) R.string.mic_unmute else R.string.mic_mute)
+            contentDescription = getString(if (callMicMuted) R.string.mic_muted_action else R.string.mic_live_action)
+            setTextColor(if (callMicMuted) 0xFFFF5B5B.toInt() else 0xFF35D07F.toInt())
+        }
+    }
+
     private fun setStatus(text: String, show: Boolean) {
         status.text = text
         status.visibility = if (show) android.view.View.VISIBLE else android.view.View.GONE
@@ -640,6 +656,15 @@ class MainActivity : AppCompatActivity() {
         // must never be covered by the gate.
         if (callLive || !endpointSet() || GatewayKey.isMissing(storedKey())) {
             modelsGate?.visibility = android.view.View.GONE
+            return
+        }
+        // Explicit all-cloud speech in ordinary Realtime does not require offline
+        // Whisper/Supertonic downloads. Other modes retain the existing model gate.
+        if (!modeIsEnhanced() &&
+            prefs.getString(ModelCatalog.KEY_STT_BACKEND, "") == ElevenLabsSettings.BACKEND &&
+            prefs.getString("tts", "") == ElevenLabsSettings.BACKEND) {
+            modelsGate?.visibility = android.view.View.GONE
+            modelsWarnReset()
             return
         }
         val missing = ModelCatalog.missingRequired(this)
@@ -1284,6 +1309,8 @@ class MainActivity : AppCompatActivity() {
         @Volatile private var active: MainActivity? = null
         @Volatile var callStartedAt = 0L
         @Volatile var liveController: VoiceController? = null
+        // Call-scoped, like the live controller: survives activity and route reconstruction.
+        @Volatile private var callMicMuted = false
         // #61: dedicated call-start permission request code + pending flag so the
         // warm-retry path never re-requests while the dialog is up / after denial.
         const val REQ_MIC_CALL = 101
@@ -1365,6 +1392,13 @@ class MainActivity : AppCompatActivity() {
     private fun wireButtons() {
         findViewById<Button>(R.id.settings).setOnClickListener { openSettings() }
         findViewById<Button>(R.id.call).setOnClickListener { if (callLive) endCall() else startCall() }
+        findViewById<Button>(R.id.mic_mute).setOnClickListener {
+            if (callLive) {
+                callMicMuted = !callMicMuted
+                liveController?.setMicrophoneMuted(callMicMuted)
+                updateMicrophoneButton()
+            }
+        }
         findViewById<Button>(R.id.commands).setOnClickListener { showCommands() }
     }
 
