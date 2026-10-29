@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="mic_mute">Mute mic</string>
+    <string name="mic_unmute">Unmute mic</string>
+    <string name="mic_live_action">Microphone on. Mute microphone</string>
+    <string name="mic_muted_action">Microphone muted. Unmute microphone</string>
+</resources>

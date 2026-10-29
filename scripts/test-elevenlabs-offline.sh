@@ -12,3 +12,5 @@ java -cp "$out" com.hermesvox.speech.ElevenLabsProtocolTest
 java -cp "$out" com.hermesvox.speech.SpeechChunksTest
 java -cp "$out" com.hermesvox.speech.PcmStreamTest
 java -cp "$out" com.hermesvox.speech.PcmDrainTest
+java -cp "$out" com.hermesvox.speech.MicrophoneGateTest "$repo/android/app/src/main/java/com/hermesvox/VoiceController.kt"
+java -cp "$out" com.hermesvox.speech.PlatformRearmTest "$repo/android/app/src/main/java/com/hermesvox/VoiceController.kt"

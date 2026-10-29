@@ -54,8 +54,46 @@ class VoiceController(private val context: Context, private val session: HermesS
     // chain (else platform) so the loop never transcribes against a dead leg.
     @Volatile private var remoteLeg: RemoteStt? = null
     private var vad: SileroVadGate? = null
-    private var record: AudioRecord? = null
-    private var ns: android.media.audiofx.NoiseSuppressor? = null
+    private val microphone = com.hermesvox.speech.MicrophoneGate<AutoCloseable>()
+    @Volatile private var platformCapture = false
+
+    /** Independent capture control: never stop/silence the agent or output here. Main thread. */
+    fun setMicrophoneMuted(muted: Boolean) {
+        if (microphone.isMuted == muted) return
+        microphone.setMuted(muted)
+        latestPartial.set(null)
+        commitRequested = false
+        earlyCommitSeg = -1L
+        if (muted) {
+            // The gate already cancels/destroys its platform recognizer.
+            recognizer = null
+        } else if (platformCapture && listening && !turnInFlight && !speaking && !focusPause && !stopped) {
+            postListen()
+        }
+    }
+
+    fun isMicrophoneMuted() = microphone.isMuted
+
+    /** One capture allocation; mute closes it even while a blocking read/STT is pending. */
+    private inner class MicCapture(val audio: AudioRecord) : AutoCloseable {
+        private var noise: android.media.audiofx.NoiseSuppressor? = null
+        init {
+            if (audio.state != AudioRecord.STATE_INITIALIZED) {
+                close()
+                error("Microphone unavailable")
+            }
+            try {
+                if (micBool("ns_extra", true) && android.media.audiofx.NoiseSuppressor.isAvailable())
+                    noise = android.media.audiofx.NoiseSuppressor.create(audio.audioSessionId)?.also { it.enabled = true }
+            } catch (_: Throwable) {} // Optional NS must not disable the existing capture path.
+        }
+        override fun close() {
+            try { audio.stop() } catch (_: Throwable) {}
+            try { noise?.release() } catch (_: Throwable) {}
+            noise = null
+            try { audio.release() } catch (_: Throwable) {}
+        }
+    }
     private val exec: ExecutorService = Executors.newCachedThreadPool()
     @Volatile private var commitRequested = false
     @Volatile private var stopped = false
@@ -433,28 +471,14 @@ class VoiceController(private val context: Context, private val session: HermesS
 
     private fun listenOffline(): Boolean {
         if (loopActive) return false
+        platformCapture = false
         listener?.onState("listening"); listening = true
         val sr = 16000
         val minBuf = AudioRecord.getMinBufferSize(sr, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
         if (minBuf <= 0) return listen()
         return try {
-            // Hardware noise suppression + echo cancel on the capture side (many devices
-            // enable real AEC/NS from VOICE_COMMUNICATION). Default on; the mic settings
-            // let the user switch back to raw MIC.
+            // Allocate only at the capture boundary below, never while muted.
             val source = if (micBool("mic_aec", true)) MediaRecorder.AudioSource.VOICE_COMMUNICATION else MediaRecorder.AudioSource.MIC
-            val r = AudioRecord(source, sr, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, minBuf)
-            if (r.state != AudioRecord.STATE_INITIALIZED) return listen()
-            record = r
-            // #40/#81: push an extra platform NS on the record's session for the
-            // loud-environment case, on top of VOICE_COMMUNICATION AEC/NS. Optional
-            // (ns_extra) — disable if a device double-processes the speech.
-            try {
-                if (micBool("ns_extra", true) && android.media.audiofx.NoiseSuppressor.isAvailable()) {
-                    ns?.release(); ns = null
-                    ns = android.media.audiofx.NoiseSuppressor.create(r.audioSessionId)?.also { it.enabled = true }
-                    VoxLog.d("mic: extra NoiseSuppressor attached (session ${r.audioSessionId}) enabled=${ns?.enabled}")
-                }
-            } catch (_: Throwable) {}
             val shortBuf = ShortArray(1024)
             // Mic settings (user-changeable, logged so their impact is visible).
             val silenceMs = micInt("vad_silence_ms", 800)      // "the pause" that ends your turn
@@ -482,6 +506,8 @@ class VoiceController(private val context: Context, private val session: HermesS
                 // spans turns (the echo belongs to this line, not to one reply) and a
                 // rebuilt line relearns. See EchoFloor and docs/BARGE-WHY-0.7-WORKED.md.
                 val echoFloor = EchoFloor()
+                var lastCaptureEpoch = -1L
+                var platformFallback = false
                 // ONE owning loop. Half-duplex: it listens OR speaks, never both — so it
                 // can NEVER hear its own reply (the self-trigger/echo). The hard speak-gate
                 // (turnDone.await through speech-complete) enforces that.
@@ -491,9 +517,29 @@ class VoiceController(private val context: Context, private val session: HermesS
                     // C3 focus-loss pause: hold the mic closed (but keep the loop
                     // armed) until the host clears the flag on AUDIOFOCUS_GAIN — the
                     // controller is never stopped here (the call stays one tap away).
-                    while (listening && focusPause) android.os.SystemClock.sleep(200L)
+                    while (listening && (focusPause || microphone.isMuted)) android.os.SystemClock.sleep(40L)
                     if (!listening) break
-                    try { r.startRecording() } catch (_: Throwable) { break }
+                    val captureEpoch = microphone.epoch()
+                    if (captureEpoch != lastCaptureEpoch) {
+                        seed = null; seg.clear(); bargeCarry.reset(); latestPartial.set(null)
+                        synchronized(erBargeSeg) { erBargeSeg.clear() }
+                        vad?.reset()
+                        lastCaptureEpoch = captureEpoch
+                    }
+                    val capture = try {
+                        microphone.acquire(captureEpoch) {
+                            MicCapture(AudioRecord(source, sr, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, minBuf))
+                        } as? MicCapture
+                    } catch (_: Throwable) {
+                        platformFallback = true
+                        break
+                    } ?: continue
+                    val r = capture.audio
+                    var started = false
+                    if (!microphone.dispatch(captureEpoch) {
+                        started = try { r.startRecording(); true } catch (_: Throwable) { false }
+                    }) continue
+                    if (!started) { platformFallback = true; break }
                     // #28: listener callbacks must land on the main thread (the
                     // documented contract) — the capture loop runs on the executor.
                     main.post { listener?.onState("listening") }
@@ -508,6 +554,8 @@ class VoiceController(private val context: Context, private val session: HermesS
                     seg.clear()
                     val segId = ++segCounter
                     latestPartial.set(null)
+                    // Stable partial history belongs only to this utterance, not a pre-mute one.
+                    val partialState = VoiceLoopState(micInt("vad_early_silence_ms", EarlyStartRule.MIN_EARLY_SILENCE_MS.toInt()).toLong())
                     // TranscriptValidator inputs: the frames the VAD called speech.
                     var speechSamples = 0
                     // EarlyStartRule.mayReusePartial: seg index just past the last speech frame.
@@ -530,8 +578,9 @@ class VoiceController(private val context: Context, private val session: HermesS
                     // Batch cloud transcription is final-only: no speculative uploads or repeated billing.
                     val partialEnabled = micBool("partial_stt", true) && stt !is ElevenLabsStt
                     var lastPartialMs = android.os.SystemClock.uptimeMillis()
-                    while (listening && !commitRequested && !focusPause) {
-                        val n = r.read(shortBuf, 0, shortBuf.size)
+                    while (listening && !commitRequested && !focusPause && microphone.isCurrent(captureEpoch)) {
+                        val n = try { r.read(shortBuf, 0, shortBuf.size) } catch (_: Throwable) { 0 }
+                        if (!microphone.isCurrent(captureEpoch)) break
                         if (n <= 0) continue
                         val frames = FloatArray(n)
                         for (i in 0 until n) frames[i] = shortBuf[i] / 32768f
@@ -610,12 +659,16 @@ class VoiceController(private val context: Context, private val session: HermesS
                                 // block every future partial in the session).
                                 if (!execSubmit partial@{
                                     try {
-                                        val t = runCatching { stt?.transcribe(snap, sr) }.getOrNull()
-                                        if (t.isNullOrBlank()) return@partial
-                                        if (segCounter == segId) latestPartial.set(PartialHyp(segId, t, snapStart, snapEnd))
-                                        if (voiceState.mayStart(t, sm, now)) {
+                                        val t = runCatching { microphone.invoke(captureEpoch) { stt?.transcribe(snap, sr) } }.getOrNull()
+                                        if (t.isNullOrBlank() || !microphone.isCurrent(captureEpoch)) return@partial
+                                        if (segCounter == segId) microphone.dispatch(captureEpoch) {
+                                            latestPartial.set(PartialHyp(segId, t, snapStart, snapEnd))
+                                        }
+                                        var mayStart = false
+                                        microphone.dispatch(captureEpoch) { mayStart = partialState.mayStart(t, sm, now) }
+                                        if (mayStart) {
                                             main.post {
-                                                if (!turnInFlight && !commitRequested && segCounter == segId) {
+                                                if (microphone.isCurrent(captureEpoch) && !turnInFlight && !commitRequested && segCounter == segId) {
                                                     listener?.onLog(if (logTranscripts()) "// partial → ${t.take(120)}" else "// (partial)")
                                                     earlyCommitSeg = segId
                                                     commitRequested = true   // drain the loop; the turn runs below
@@ -629,6 +682,7 @@ class VoiceController(private val context: Context, private val session: HermesS
                     }
                     // C3: a focus loss that lands mid-capture closes the mic NOW (no
                     // transcribe delay) and parks the loop at the pause guard above.
+                    if (!microphone.isCurrent(captureEpoch)) continue
                     if (focusPause) {
                         try { r.stop() } catch (_: Throwable) {}
                         continue
@@ -663,8 +717,9 @@ class VoiceController(private val context: Context, private val session: HermesS
                     val text = when {
                         !speechOk -> null
                         reused -> partial!!.text
-                        else -> try { stt?.transcribeWhole(seg.toFloatArray(), sr) } catch (e: Throwable) { VoxLog.e("transcribe: ${e.message}"); null }
+                        else -> try { microphone.invoke(captureEpoch) { stt?.transcribeWhole(seg.toFloatArray(), sr) } } catch (e: Throwable) { VoxLog.e("transcribe: ${e.message}"); null }
                     }
+                    if (!microphone.isCurrent(captureEpoch)) continue
                     if (text != null) LatencyStats.pushStt(android.os.SystemClock.uptimeMillis() - segStart)   // #40 speech->text
                     val t = (text ?: "").trim()
                     val speechMs = speechSamples * 1000L / sr
@@ -706,8 +761,12 @@ class VoiceController(private val context: Context, private val session: HermesS
                     val vadAvailable = (vad?.isAvailable == true)
                     VoxLog.d("event=barge-watch mode=single-capture vad=${if (vadAvailable) "on" else "off"} rmsMin=${"%.2f".format(bargeRmsMin)} gen=$myGen")
                     // Fix 4: show what Hermes is about to be sent, before the reply exists.
-                    main.post { listener?.onHeard(cleaned) }
-                    main.post { runStreamedTurn(cleaned, myGen, fromVoice = true) }
+                    main.post {
+                        if (!microphone.dispatch(captureEpoch) {
+                            listener?.onHeard(cleaned)
+                            runStreamedTurn(cleaned, myGen, fromVoice = true)
+                        }) latch.countDown() // discarded queued utterance, not an active agent run
+                    }
                     // Single-capture barge drain. While the gate is locked we keep r
                     // recording and read frames here — compute RMS, feed the SHARED VAD,
                     // and route a barge check when `speaking` (playback mode) or
@@ -730,7 +789,9 @@ class VoiceController(private val context: Context, private val session: HermesS
                     // sustains + decision, and BargeCarry's history/onset/fire. Extracted
                     // so a synthetic 16 kHz signal can be pushed through this exact code
                     // off-device (BargeAudioPathTest), with no mic, VAD or wall clock.
-                    val bargeAudio = BargeAudioPath(sr, bargeRmsMin, vadAvailable, levelOnlyMs, bargeCarry, echo = echoFloor)
+                    var bargeAudio = BargeAudioPath(sr, bargeRmsMin, vadAvailable, levelOnlyMs, bargeCarry, echo = echoFloor)
+                    var drainEpoch = captureEpoch
+                    var drainRecord = r
                     // Second accumulator (0.4.0.2 level-only escape): net time the RMS held
                     // above the RAISED bar (floor * LEVEL_ONLY_BOOST), its own bar, tracked
                     // with the same readAt clock discipline + the same O(1) float math as
@@ -779,7 +840,34 @@ class VoiceController(private val context: Context, private val session: HermesS
                         if (turnInFlight || speaking || sRunning) lastAliveAt = tickAt
                         if (TurnGateCeiling.expired(tickAt, gateClosedAt, lastAliveAt)) { ceilingHit = true; break }
                         if (latch.count == 0L) { gateReleased = true; break }   // gate open -> stop draining
-                        val n = try { r.read(shortBuf, 0, shortBuf.size) } catch (_: Throwable) { 0 }
+                        if (!microphone.isCurrent(drainEpoch) && !microphone.isMuted && !focusPause) {
+                            // Explicit unmute may restore barge capture, but only from fresh hardware.
+                            drainEpoch = microphone.epoch()
+                            val resumed = try {
+                                microphone.acquire(drainEpoch) {
+                                    MicCapture(AudioRecord(source, sr, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, minBuf))
+                                } as? MicCapture
+                            } catch (_: Throwable) { null }
+                            if (resumed != null) {
+                                drainRecord = resumed.audio
+                                lastCaptureEpoch = drainEpoch
+                                microphone.dispatch(drainEpoch) { try { drainRecord.startRecording() } catch (_: Throwable) {} }
+                                bargeCarry.reset(); vad?.reset()
+                                synchronized(erBargeSeg) { erBargeSeg.clear() }
+                                bargeAudio = BargeAudioPath(sr, bargeRmsMin, vadAvailable, levelOnlyMs, bargeCarry, echo = echoFloor)
+                                lastReadAtMs = 0L; sawPlayback = false
+                            } else {
+                                // Retry only acquisition (never STT/provider work); avoid reading a released record.
+                                drainEpoch = -1L
+                            }
+                        }
+                        if (!microphone.isCurrent(drainEpoch) || focusPause) {
+                            // Keep the response/playback gate intact; never read/reopen a muted mic.
+                            try { latch.await(40L, java.util.concurrent.TimeUnit.MILLISECONDS) } catch (_: Throwable) {}
+                            continue
+                        }
+                        val n = try { drainRecord.read(shortBuf, 0, shortBuf.size) } catch (_: Throwable) { 0 }
+                        if (!microphone.isCurrent(drainEpoch)) continue
                         if (n <= 0) {
                             // No frames yet: bounded poll so a release is still observed
                             // (also the timeout ceiling's tick). Reads above pace the mic.
@@ -873,7 +961,8 @@ class VoiceController(private val context: Context, private val session: HermesS
                         if (bf.fired) {
                             VoxLog.d("event=barge-in source=single-capture mode=${if (spk) "playback" else "generation"} rms=${"%.3f".format(bf.level)} vad=$vadSpeech gen=$myGen speaking=$spk")
                             bargeDecisionAt = android.os.SystemClock.uptimeMillis()   // #D1: measure main-queue delay to the gate release
-                            main.post { bargeIn() }
+                            val bargeEpoch = drainEpoch
+                            main.post { microphone.dispatch(bargeEpoch) { bargeIn() } }
                         } else if (spk && bf.nearMiss &&
                             readAt - nearMissLoggedAtMs >= BARGE_NEARMISS_WINDOW_MS) {
                             // T1 CAUSE C probe (decide false): the user is audibly there but the
@@ -907,7 +996,7 @@ class VoiceController(private val context: Context, private val session: HermesS
                         val held = erHoldReleasedGen == myGen
                         val carriedMs = bargeCarry.carriedMs
                         val leadMs = bargeCarry.leadMs
-                        if (BargeCarry.shouldSeed(true, gateReleased, held) && listening) {
+                        if (BargeCarry.shouldSeed(true, gateReleased, held) && listening && microphone.isCurrent(drainEpoch)) {
                             seed = bargeCarry.take()
                             VoxLog.d("event=barge-carry gen=$myGen seeded=true ms=$carriedMs leadMs=$leadMs")
                         } else {
@@ -922,13 +1011,15 @@ class VoiceController(private val context: Context, private val session: HermesS
                         echoGuardUntil = android.os.SystemClock.uptimeMillis() + EchoTailRule.GUARD_MS
                     }
                 }
-                loopActive = false
                 // #19: the natural loop exit never runs stop() (the caller's terminal
                 // path), so release the native AudioRecord here — otherwise the next
                 // start() overwrites `record` and leaks one audio session per listen.
-                try { record?.stop(); record?.release() } catch (_: Throwable) {}
-                record = null
-                main.post { listener?.onState("idle") }
+                microphone.invalidate()
+                loopActive = false
+                main.post {
+                    if (platformFallback && !stopped) listen()
+                    else listener?.onState("idle")
+                }
             }) return false   // 0.5.0.1 / H3: executor stopped/shutdown (or the submit raced teardown) — don't open the mic
             true
         } catch (e: Throwable) {
@@ -939,6 +1030,7 @@ class VoiceController(private val context: Context, private val session: HermesS
 
     fun stop() {
         listening = false
+        microphone.invalidate()
         recognizer?.destroy(); recognizer = null
         // ER Phase 4: controller teardown kills the presence loop first — its
         // handler callbacks must never outlive the executor they feed.
@@ -970,9 +1062,7 @@ class VoiceController(private val context: Context, private val session: HermesS
         while ((loopActive || partialRunning) && waited < 500L) {
             android.os.SystemClock.sleep(20L); waited = android.os.SystemClock.uptimeMillis() - drainStart
         }
-        try { record?.stop(); record?.release() } catch (_: Exception) {}
-        record = null
-        try { ns?.release() } catch (_: Exception) {}; ns = null
+
         tts?.shutdown()
         stt?.shutdown(); vad?.shutdown()
         // After shutting the legs down the pipeline is no longer warm: reset the ready
@@ -1015,6 +1105,12 @@ class VoiceController(private val context: Context, private val session: HermesS
 
     // --- Listening (on-device STT; guarded for a headless emulator / missing service) ---
     private fun listen(): Boolean {
+        if (stopped) return false
+        platformCapture = true
+        listening = true
+        if (microphone.isMuted || focusPause || turnInFlight || speaking) return true
+        microphone.invalidate()
+        val captureEpoch = microphone.epoch()
         stopTts()
         listening = true
         listener?.onState("listening")
@@ -1030,13 +1126,17 @@ class VoiceController(private val context: Context, private val session: HermesS
                 override fun onPartialResults(p: Bundle) {}
                 override fun onEvent(t: Int, p: Bundle?) {}
                 override fun onResults(p: Bundle) {
+                    if (!microphone.isCurrent(captureEpoch) || stopped) return
                     val text = p.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull() ?: return
                     // 0.6.8: the same bracketed-noise strip as the on-device loop —
                     // platform transcripts hallucinate [sound]/(buzzing) too.
                     val cleaned = text.replace(Regex("\\[[^\\]]{0,30}\\]|\\([^)]{0,30}\\)"), " ").trim()
-                    if (cleaned.isNotBlank() && cleaned.length >= 3) runStreamedTurn(cleaned, turnGen, fromVoice = true) else if (listening) listen()
+                    if (cleaned.isNotBlank() && cleaned.length >= 3) microphone.dispatch(captureEpoch) {
+                        runStreamedTurn(cleaned, turnGen, fromVoice = true)
+                    } else if (listening) listen()
                 }
                 override fun onError(e: Int) {
+                    if (!microphone.isCurrent(captureEpoch) || stopped) return
                     if (e == SpeechRecognizer.ERROR_SPEECH_TIMEOUT || e == SpeechRecognizer.ERROR_NO_MATCH) {
                         if (listening) listen()
                     } else {
@@ -1052,7 +1152,11 @@ class VoiceController(private val context: Context, private val session: HermesS
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.US.toLanguageTag())
                 putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
             }
-            r.startListening(intent)
+            val owned = microphone.acquire(captureEpoch) {
+                r.startListening(intent)
+                AutoCloseable { r.cancel(); r.destroy() }
+            }
+            if (owned == null) { r.destroy(); recognizer = null }
             listener?.onLog("// hear → listening")
             true
         } catch (e: Throwable) {
@@ -1143,6 +1247,7 @@ class VoiceController(private val context: Context, private val session: HermesS
         }
         turnInFlight = true
         voiceState.arm()        // #60: re-arm exactly-once for this turn (via VoiceLoopState)
+        val gateEpoch = voiceState.epoch() // platform turnGen can be reused; fence worker/rearm by both
         // C4: per-turn latches + origin. firstTextLatch arms the first-delta push;
         // firstAudioPushed arms the first-REAL-audio push (the streamChunk seam in the
         // streaming worker). turnStartedAt gives the worker the SAME t0 origin every
@@ -1348,7 +1453,12 @@ class VoiceController(private val context: Context, private val session: HermesS
                 }
             } finally {
                 currentStream = null
-                turnInFlight = false
+                if (gen == turnGen && gateEpoch == voiceState.epoch()) {
+                    turnInFlight = false
+                    // Gate release may already have run on main while this worker was
+                    // busy (error/empty reply). Retry now; the live gate still owns speech.
+                    rearmPlatformAfterTurn(gen, gateEpoch)
+                }
                 // ER Phase 4/5: the mind has answered (or failed) — the presence
                 // window closes; the reply's speech owns the floor now.
                 if (erActive || erMindLive) {
@@ -1979,6 +2089,8 @@ class VoiceController(private val context: Context, private val session: HermesS
     }
 
     private fun bargeIn() {
+        if (microphone.isMuted) return
+        val bargeCaptureEpoch = microphone.epoch()
         // #B1.5: never interrupt when no turn/speech is actually live — closes the
         // race where a playback watch fired barge-in while speaking had already gone
         // false (a duplicate release that chopped the NEXT listen).
@@ -2023,7 +2135,9 @@ class VoiceController(private val context: Context, private val session: HermesS
         VoxLog.er("event=er-barge-fire hold=staged frames=${segSnapshot.size} gen=$myGen")
         execSubmit barge@{
             val raw = try {
-                if (segSnapshot.size >= 16000 * 300 / 1000) stt?.transcribeWhole(segSnapshot, 16000)?.trim() else null
+                if (segSnapshot.size >= 16000 * 300 / 1000)
+                    microphone.invoke(bargeCaptureEpoch) { stt?.transcribeWhole(segSnapshot, 16000)?.trim() }
+                else null
             } catch (_: Throwable) { null }
             // Fix 2: the classifier reads a validated transcript too — a hallucinated
             // "(buzzing)" / looped phrase is no utterance (null → HOLD, the safe side).
@@ -2034,7 +2148,7 @@ class VoiceController(private val context: Context, private val session: HermesS
             VoxLog.er("event=er-barge-verdict gen=$myGen text=${if (logTranscripts()) (said ?: "").take(80) else "<hidden>"} verdict=$verdict")
             main.post {
                 // Re-check the turn is still live and un-superceded before acting.
-                if (myGen != turnGen || !turnInFlight) return@post
+                if (myGen != turnGen || !turnInFlight || !microphone.isCurrent(bargeCaptureEpoch)) return@post
                 when (verdict) {
                     ErBargeGate.Verdict.CANCEL_MIND -> {
                         genCancelled = true
@@ -2079,6 +2193,18 @@ class VoiceController(private val context: Context, private val session: HermesS
         releaseTurnGate(turnGen, reason)
     }
 
+    /** Both transitions must retry: gate release can precede worker-idle or vice versa. */
+    private fun rearmPlatformAfterTurn(gen: Long, gateEpoch: Long) {
+        if (!platformCapture || !listening || stopped) return
+        com.hermesvox.speech.PlatformRearm.post(microphone, microphone.epoch(),
+            {
+                gen == turnGen && gateEpoch == voiceState.epoch() && voiceState.released() &&
+                    platformCapture && listening && !turnInFlight && !speaking && !focusPause && !stopped
+            },
+            { task -> main.post(task); Unit },
+            { listen(); Unit })
+    }
+
     private fun releaseTurnGate(gen: Long, reason: String) {
         if (gen != turnGen) { VoxLog.w("event=gate-release result=stale gen=$gen current=$turnGen reason=$reason"); return }
         // Not a warning. On hangup the turn has usually released the gate already, so a duplicate
@@ -2086,6 +2212,7 @@ class VoiceController(private val context: Context, private val session: HermesS
         // exactly the logs we read for field evidence.
         if (!voiceState.release()) { VoxLog.d("event=gate-release result=duplicate gen=$gen reason=$reason"); return }
         try { turnDone.countDown() } catch (_: Throwable) {}
+        rearmPlatformAfterTurn(gen, voiceState.epoch())
         VoxLog.d("event=gate-release gen=$gen reason=$reason")          // (audit's epoch= dropped — private)
         // T3 phantom-turn guard (log honesty): a mid-generation endCall/hangup releases
         // with outcome=stop, and stop()'s voiceState.reset() clears the duplicate latch —
@@ -2127,6 +2254,8 @@ class VoiceController(private val context: Context, private val session: HermesS
      *  later with one tap; an interrupted reply is NOT auto-resumed on GAIN). */
     fun pauseForFocusLoss() {
         focusPause = true
+        microphone.invalidate() // discard old input, but preserve explicit mute across GAIN
+        recognizer = null
         silenceAll("focus-loss")
     }
 
@@ -2135,6 +2264,7 @@ class VoiceController(private val context: Context, private val session: HermesS
      *  reply was already cut by pauseForFocusLoss's silenceAll and stays cut. */
     fun resumeFromFocusLoss() {
         focusPause = false
+        if (platformCapture && listening && !microphone.isMuted && !stopped) postListen()
         if (listening) listener?.onState("listening")
     }
 
